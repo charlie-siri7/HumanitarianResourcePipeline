@@ -1,14 +1,13 @@
 import os
-import time
 from dotenv import load_dotenv
 from supabase import create_client
-from clients.hrsa_client import HRSAClient
+from clients.hrsa_client import HRSAClient, clean_text, extract_street_number_and_name
 from models.schema import EnrichedResource
 from pipeline.load import batch_upsert
 
 load_dotenv()
 
-def run_enrichment(batch_limit: int = 50, dry_run: bool = False):
+def run_enrichment(batch_limit: int = 200, dry_run: bool = False):
     supabase = create_client(
         os.getenv("SUPABASE_URL"), 
         os.getenv("SUPABASE_SERVICE_ROLE_KEY")
@@ -17,41 +16,55 @@ def run_enrichment(batch_limit: int = 50, dry_run: bool = False):
     print("Fetching HRSA Ohio directory...")
     hrsa = HRSAClient()
     registry = hrsa.get_ohio_health_centers()
-    print(f"Loaded {len(registry)} Ohio health centers into memory.")
+    print(f"Loaded {len(registry['by_street'])} address keys and {len(registry['by_name'])} name keys.")
 
-    # Target records needing hours or clean descriptions
-    print(f"Pulling {batch_limit} target records from staging...")
+    # Target HRSA records needing hours or clean descriptions
+    print(f"Pulling {batch_limit} candidate records from staging...")
     query = supabase.table("resources") \
         .select("id, name, address, city, phone, website, hours, description") \
-        .or_("hours.is.null,hours.like.%call for schedule%,description.like.Source:%") \
+        .ilike("description", "%HRSA%") \
         .limit(batch_limit) \
         .execute()
     
     records = query.data
+    print(f"Retrieved {len(records)} candidate records from database.")
     updates = []
 
     for row in records:
-        addr = str(row.get("address") or "").strip().lower()
-        city = str(row.get("city") or "").strip().lower()
-        match = registry.get(f"{addr} {city}")
+        addr = row.get("address") or ""
+        name = row.get("name") or ""
+
+        # Check street match first, fallback to clinic name
+        street_key = extract_street_number_and_name(addr)
+        match = registry["by_street"].get(street_key)
+        if not match:
+            match = registry["by_name"].get(clean_text(name))
 
         if match:
-            # Build clean user-facing description
-            grantee = match.get("Grantee_Name", "Federally Qualified Health Center")
+            grantee = match.get("Grantee_Name") or "Community Health Organization"
             service_desc = (
-                f"HRSA-designated Community Health Center operated by {grantee}. "
-                f"Provides accessible primary care and preventive health services "
-                f"with sliding-fee discount programs."
+                f"HRSA Health Center site operated by {grantee}. "
+                f"Offers accessible primary care and community health services "
+                f"with sliding-fee scale eligibility."
             )
             
             raw_hours = match.get("Operating_Hours")
-            hours_val = raw_hours if raw_hours else "Mon-Fri: 8:00 AM - 5:00 PM"
+            
+            # Format hours cleanly whether it is a numeric float (47.0) or a string
+            if raw_hours is not None and str(raw_hours).strip() != "" and str(raw_hours).lower() != "nan":
+                try:
+                    hrs_num = float(raw_hours)
+                    hours_val = f"Mon-Fri: ~{int(hrs_num)} hrs/week (call for daily schedule)"
+                except ValueError:
+                    hours_val = str(raw_hours).strip()
+            else:
+                hours_val = "Mon-Fri: 8:00 AM - 5:00 PM"
 
             updates.append(EnrichedResource(
                 id=row["id"],
                 name=row["name"],
-                phone=row.get("phone") or match.get("Site_Telephone_Number"),
-                website=row.get("website") or match.get("Site_Web_URL"),
+                phone=row.get("phone") or (str(match.get("Site_Telephone_Number")) if match.get("Site_Telephone_Number") else None),
+                website=row.get("website") or (str(match.get("Site_Web_URL")) if match.get("Site_Web_URL") else None),
                 description=service_desc,
                 hours=hours_val
             ))
@@ -70,5 +83,4 @@ def run_enrichment(batch_limit: int = 50, dry_run: bool = False):
         print("Upsert completed successfully.")
 
 if __name__ == "__main__":
-    # Start with a safe dry run of 50 records
-    run_enrichment(batch_limit=50, dry_run=False)
+    run_enrichment(batch_limit=200, dry_run=False)
